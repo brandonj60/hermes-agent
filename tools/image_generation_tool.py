@@ -39,7 +39,7 @@ from urllib.parse import urlencode
 import fal_client
 from tools.debug_helpers import DebugSession
 from tools.managed_tool_gateway import resolve_managed_tool_gateway
-from tools.tool_backend_helpers import managed_nous_tools_enabled
+from tools.tool_backend_helpers import managed_nous_tools_enabled, prefers_gateway
 
 logger = logging.getLogger(__name__)
 
@@ -61,7 +61,6 @@ ASPECT_RATIO_MAP = {
     "square": "square_hd",
     "portrait": "portrait_16_9"
 }
-VALID_ASPECT_RATIOS = list(ASPECT_RATIO_MAP.keys())
 
 # Configuration for automatic upscaling
 UPSCALER_MODEL = "fal-ai/clarity-upscaler"
@@ -88,8 +87,9 @@ _managed_fal_client_lock = threading.Lock()
 
 
 def _resolve_managed_fal_gateway():
-    """Return managed fal-queue gateway config when direct FAL credentials are absent."""
-    if os.getenv("FAL_KEY"):
+    """Return managed fal-queue gateway config when the user prefers the gateway
+    or direct FAL credentials are absent."""
+    if os.getenv("FAL_KEY") and not prefers_gateway("image_gen"):
         return None
     return resolve_managed_tool_gateway("fal-queue")
 
@@ -564,15 +564,6 @@ def check_image_generation_requirements() -> bool:
         return False
 
 
-def get_debug_session_info() -> Dict[str, Any]:
-    """
-    Get information about the current debug session.
-    
-    Returns:
-        Dict[str, Any]: Dictionary containing debug session information
-    """
-    return _debug.get_session_info()
-
 
 if __name__ == "__main__":
     """
@@ -652,7 +643,7 @@ if __name__ == "__main__":
 # ---------------------------------------------------------------------------
 # Registry
 # ---------------------------------------------------------------------------
-from tools.registry import registry
+from tools.registry import registry, tool_error
 
 IMAGE_GENERATE_SCHEMA = {
     "name": "image_generate",
@@ -679,7 +670,7 @@ IMAGE_GENERATE_SCHEMA = {
 def _handle_image_generate(args, **kw):
     prompt = args.get("prompt", "")
     if not prompt:
-        return json.dumps({"error": "prompt is required for image generation"})
+        return tool_error("prompt is required for image generation")
     return image_generate_tool(
         prompt=prompt,
         aspect_ratio=args.get("aspect_ratio", "landscape"),

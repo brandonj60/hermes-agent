@@ -17,7 +17,6 @@ import json
 import logging
 import os
 import random
-import re
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -37,6 +36,7 @@ from gateway.platforms.base import (
     cache_document_from_bytes,
     cache_image_from_url,
 )
+from gateway.platforms.helpers import redact_phone
 
 logger = logging.getLogger(__name__)
 
@@ -51,21 +51,9 @@ SSE_RETRY_DELAY_MAX = 60.0
 HEALTH_CHECK_INTERVAL = 30.0  # seconds between health checks
 HEALTH_CHECK_STALE_THRESHOLD = 120.0  # seconds without SSE activity before concern
 
-# E.164 phone number pattern for redaction
-_PHONE_RE = re.compile(r"\+[1-9]\d{6,14}")
-
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-def _redact_phone(phone: str) -> str:
-    """Redact a phone number for logging: +15551234567 -> +155****4567."""
-    if not phone:
-        return "<none>"
-    if len(phone) <= 8:
-        return phone[:2] + "****" + phone[-2:] if len(phone) > 4 else "****"
-    return phone[:4] + "****" + phone[-4:]
 
 
 def _parse_comma_list(value: str) -> List[str]:
@@ -184,10 +172,8 @@ class SignalAdapter(BasePlatformAdapter):
         self._recent_sent_timestamps: set = set()
         self._max_recent_timestamps = 50
 
-        self._phone_lock_identity: Optional[str] = None
-
         logger.info("Signal adapter initialized: url=%s account=%s groups=%s",
-                     self.http_url, _redact_phone(self.account),
+                     self.http_url, redact_phone(self.account),
                      "enabled" if self.group_allow_from else "disabled")
 
     # ------------------------------------------------------------------
@@ -202,23 +188,7 @@ class SignalAdapter(BasePlatformAdapter):
 
         # Acquire scoped lock to prevent duplicate Signal listeners for the same phone
         try:
-            from gateway.status import acquire_scoped_lock
-
-            self._phone_lock_identity = self.account
-            acquired, existing = acquire_scoped_lock(
-                "signal-phone",
-                self._phone_lock_identity,
-                metadata={"platform": self.platform.value},
-            )
-            if not acquired:
-                owner_pid = existing.get("pid") if isinstance(existing, dict) else None
-                message = (
-                    "Another local Hermes gateway is already using this Signal account"
-                    + (f" (PID {owner_pid})." if owner_pid else ".")
-                    + " Stop the other gateway before starting a second Signal listener."
-                )
-                logger.error("Signal: %s", message)
-                self._set_fatal_error("signal_phone_lock", message, retryable=False)
+            if not self._acquire_platform_lock('signal-phone', self.account, 'Signal account'):
                 return False
         except Exception as e:
             logger.warning("Signal: Could not acquire phone lock (non-fatal): %s", e)
@@ -270,13 +240,7 @@ class SignalAdapter(BasePlatformAdapter):
             await self.client.aclose()
             self.client = None
 
-        if self._phone_lock_identity:
-            try:
-                from gateway.status import release_scoped_lock
-                release_scoped_lock("signal-phone", self._phone_lock_identity)
-            except Exception as e:
-                logger.warning("Signal: Error releasing phone lock: %s", e, exc_info=True)
-            self._phone_lock_identity = None
+        self._release_platform_lock()
 
         logger.info("Signal: disconnected")
 
@@ -542,7 +506,7 @@ class SignalAdapter(BasePlatformAdapter):
         )
 
         logger.debug("Signal: message from %s in %s: %s",
-                      _redact_phone(sender), chat_id[:20], (text or "")[:50])
+                      redact_phone(sender), chat_id[:20], (text or "")[:50])
 
         await self.handle_message(event)
 
@@ -647,7 +611,11 @@ class SignalAdapter(BasePlatformAdapter):
 
         if result is not None:
             self._track_sent_timestamp(result)
-            return SendResult(success=True)
+            # Use the timestamp from the RPC result as a pseudo message_id.
+            # Signal doesn't have real message IDs, but the stream consumer
+            # needs a truthy value to follow its edit→fallback path correctly.
+            _msg_id = str(result.get("timestamp", "")) if isinstance(result, dict) else None
+            return SendResult(success=True, message_id=_msg_id or None)
         return SendResult(success=False, error="RPC send failed")
 
     def _track_sent_timestamp(self, rpc_result) -> None:
@@ -717,19 +685,27 @@ class SignalAdapter(BasePlatformAdapter):
             return SendResult(success=True)
         return SendResult(success=False, error="RPC send with attachment failed")
 
-    async def send_document(
+    async def _send_attachment(
         self,
         chat_id: str,
         file_path: str,
+        media_label: str,
         caption: Optional[str] = None,
-        filename: Optional[str] = None,
-        **kwargs,
     ) -> SendResult:
-        """Send a document/file attachment."""
+        """Send any file as a Signal attachment via RPC.
+
+        Shared implementation for send_document, send_image_file, send_voice,
+        and send_video — avoids duplicating the validation/routing/RPC logic.
+        """
         await self._stop_typing_indicator(chat_id)
 
-        if not Path(file_path).exists():
-            return SendResult(success=False, error="File not found")
+        try:
+            file_size = Path(file_path).stat().st_size
+        except FileNotFoundError:
+            return SendResult(success=False, error=f"{media_label} file not found: {file_path}")
+
+        if file_size > SIGNAL_MAX_ATTACHMENT_SIZE:
+            return SendResult(success=False, error=f"{media_label} too large ({file_size} bytes)")
 
         params: Dict[str, Any] = {
             "account": self.account,
@@ -746,26 +722,63 @@ class SignalAdapter(BasePlatformAdapter):
         if result is not None:
             self._track_sent_timestamp(result)
             return SendResult(success=True)
-        return SendResult(success=False, error="RPC send document failed")
+        return SendResult(success=False, error=f"RPC send {media_label.lower()} failed")
+
+    async def send_document(
+        self,
+        chat_id: str,
+        file_path: str,
+        caption: Optional[str] = None,
+        filename: Optional[str] = None,
+        **kwargs,
+    ) -> SendResult:
+        """Send a document/file attachment."""
+        return await self._send_attachment(chat_id, file_path, "File", caption)
+
+    async def send_image_file(
+        self,
+        chat_id: str,
+        image_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        **kwargs,
+    ) -> SendResult:
+        """Send a local image file as a native Signal attachment.
+
+        Called by the gateway media delivery flow when MEDIA: tags containing
+        image paths are extracted from agent responses.
+        """
+        return await self._send_attachment(chat_id, image_path, "Image", caption)
+
+    async def send_voice(
+        self,
+        chat_id: str,
+        audio_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        **kwargs,
+    ) -> SendResult:
+        """Send an audio file as a Signal attachment.
+
+        Signal does not distinguish voice messages from file attachments at
+        the API level, so this routes through the same RPC send path.
+        """
+        return await self._send_attachment(chat_id, audio_path, "Audio", caption)
+
+    async def send_video(
+        self,
+        chat_id: str,
+        video_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        **kwargs,
+    ) -> SendResult:
+        """Send a video file as a Signal attachment."""
+        return await self._send_attachment(chat_id, video_path, "Video", caption)
 
     # ------------------------------------------------------------------
     # Typing Indicators
     # ------------------------------------------------------------------
-
-    async def _start_typing_indicator(self, chat_id: str) -> None:
-        """Start a typing indicator loop for a chat."""
-        if chat_id in self._typing_tasks:
-            return  # Already running
-
-        async def _typing_loop():
-            try:
-                while True:
-                    await self.send_typing(chat_id)
-                    await asyncio.sleep(TYPING_INTERVAL)
-            except asyncio.CancelledError:
-                pass
-
-        self._typing_tasks[chat_id] = asyncio.create_task(_typing_loop())
 
     async def _stop_typing_indicator(self, chat_id: str) -> None:
         """Stop a typing indicator loop for a chat."""
@@ -776,6 +789,11 @@ class SignalAdapter(BasePlatformAdapter):
                 await task
             except asyncio.CancelledError:
                 pass
+
+    async def stop_typing(self, chat_id: str) -> None:
+        """Public interface for stopping typing — called by base adapter's
+        _keep_typing finally block to clean up platform-level typing tasks."""
+        await self._stop_typing_indicator(chat_id)
 
     # ------------------------------------------------------------------
     # Chat Info

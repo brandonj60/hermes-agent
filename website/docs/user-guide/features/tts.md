@@ -8,15 +8,22 @@ description: "Text-to-speech and voice message transcription across all platform
 
 Hermes Agent supports both text-to-speech output and voice message transcription across all messaging platforms.
 
+:::tip Nous Subscribers
+If you have a paid [Nous Portal](https://portal.nousresearch.com) subscription, OpenAI TTS is available through the **[Tool Gateway](tool-gateway.md)** without a separate OpenAI API key. Run `hermes model` or `hermes tools` to enable it.
+:::
+
 ## Text-to-Speech
 
-Convert text to speech with four providers:
+Convert text to speech with seven providers:
 
 | Provider | Quality | Cost | API Key |
 |----------|---------|------|---------|
 | **Edge TTS** (default) | Good | Free | None needed |
 | **ElevenLabs** | Excellent | Paid | `ELEVENLABS_API_KEY` |
 | **OpenAI TTS** | Good | Paid | `VOICE_TOOLS_OPENAI_KEY` |
+| **MiniMax TTS** | Excellent | Paid | `MINIMAX_API_KEY` |
+| **Mistral (Voxtral TTS)** | Excellent | Paid | `MISTRAL_API_KEY` |
+| **Google Gemini TTS** | Excellent | Free tier | `GEMINI_API_KEY` |
 | **NeuTTS** | Good | Free | None needed |
 
 ### Platform Delivery
@@ -33,9 +40,11 @@ Convert text to speech with four providers:
 ```yaml
 # In ~/.hermes/config.yaml
 tts:
-  provider: "edge"              # "edge" | "elevenlabs" | "openai" | "neutts"
+  provider: "edge"              # "edge" | "elevenlabs" | "openai" | "minimax" | "mistral" | "gemini" | "neutts"
+  speed: 1.0                    # Global speed multiplier (provider-specific settings override this)
   edge:
     voice: "en-US-AriaNeural"   # 322 voices, 74 languages
+    speed: 1.0                  # Converted to rate percentage (+/-%)
   elevenlabs:
     voice_id: "pNInz6obpgDQGcFmaJgB"  # Adam
     model_id: "eleven_multilingual_v2"
@@ -43,6 +52,19 @@ tts:
     model: "gpt-4o-mini-tts"
     voice: "alloy"              # alloy, echo, fable, onyx, nova, shimmer
     base_url: "https://api.openai.com/v1"  # Override for OpenAI-compatible TTS endpoints
+    speed: 1.0                  # 0.25 - 4.0
+  minimax:
+    model: "speech-2.8-hd"     # speech-2.8-hd (default), speech-2.8-turbo
+    voice_id: "English_Graceful_Lady"  # See https://platform.minimax.io/faq/system-voice-id
+    speed: 1                    # 0.5 - 2.0
+    vol: 1                      # 0 - 10
+    pitch: 0                    # -12 - 12
+  mistral:
+    model: "voxtral-mini-tts-2603"
+    voice_id: "c69964a6-ab8b-4f8a-9465-ec0925096ec8"  # Paul - Neutral (default)
+  gemini:
+    model: "gemini-2.5-flash-preview-tts"  # or gemini-2.5-pro-preview-tts
+    voice: "Kore"               # 30 prebuilt voices: Zephyr, Puck, Kore, Enceladus, Gacrux, etc.
   neutts:
     ref_audio: ''
     ref_text: ''
@@ -50,12 +72,16 @@ tts:
     device: cpu
 ```
 
+**Speed control**: The global `tts.speed` value applies to all providers by default. Each provider can override it with its own `speed` setting (e.g., `tts.openai.speed: 1.5`). Provider-specific speed takes precedence over the global value. Default is `1.0` (normal speed).
+
 ### Telegram Voice Bubbles & ffmpeg
 
 Telegram voice bubbles require Opus/OGG audio format:
 
-- **OpenAI and ElevenLabs** produce Opus natively — no extra setup
+- **OpenAI, ElevenLabs, and Mistral** produce Opus natively — no extra setup
 - **Edge TTS** (default) outputs MP3 and needs **ffmpeg** to convert:
+- **MiniMax TTS** outputs MP3 and needs **ffmpeg** to convert for Telegram voice bubbles
+- **Google Gemini TTS** outputs raw PCM and uses **ffmpeg** to encode Opus directly for Telegram voice bubbles
 - **NeuTTS** outputs WAV and also needs **ffmpeg** to convert for Telegram voice bubbles
 
 ```bash
@@ -69,10 +95,10 @@ brew install ffmpeg
 sudo dnf install ffmpeg
 ```
 
-Without ffmpeg, Edge TTS and NeuTTS audio are sent as regular audio files (playable, but shown as a rectangular player instead of a voice bubble).
+Without ffmpeg, Edge TTS, MiniMax TTS, and NeuTTS audio are sent as regular audio files (playable, but shown as a rectangular player instead of a voice bubble).
 
 :::tip
-If you want voice bubbles without installing ffmpeg, switch to the OpenAI or ElevenLabs provider.
+If you want voice bubbles without installing ffmpeg, switch to the OpenAI, ElevenLabs, or Mistral provider.
 :::
 
 ## Voice Message Transcription (STT)
@@ -94,11 +120,13 @@ Local transcription works out of the box when `faster-whisper` is installed. If 
 ```yaml
 # In ~/.hermes/config.yaml
 stt:
-  provider: "local"           # "local" | "groq" | "openai"
+  provider: "local"           # "local" | "groq" | "openai" | "mistral"
   local:
     model: "base"             # tiny, base, small, medium, large-v3
   openai:
     model: "whisper-1"        # whisper-1, gpt-4o-mini-transcribe, gpt-4o-transcribe
+  mistral:
+    model: "voxtral-mini-latest"  # voxtral-mini-latest, voxtral-mini-2602
 ```
 
 ### Provider Details
@@ -117,6 +145,8 @@ stt:
 
 **OpenAI API** — Accepts `VOICE_TOOLS_OPENAI_KEY` first and falls back to `OPENAI_API_KEY`. Supports `whisper-1`, `gpt-4o-mini-transcribe`, and `gpt-4o-transcribe`.
 
+**Mistral API (Voxtral Transcribe)** — Requires `MISTRAL_API_KEY`. Uses Mistral's [Voxtral Transcribe](https://docs.mistral.ai/capabilities/audio/speech_to_text/) models. Supports 13 languages, speaker diarization, and word-level timestamps. Install with `pip install hermes-agent[mistral]`.
+
 **Custom local CLI fallback** — Set `HERMES_LOCAL_STT_COMMAND` if you want Hermes to call a local transcription command directly. The command template supports `{input_path}`, `{output_dir}`, `{language}`, and `{model}` placeholders.
 
 ### Fallback Behavior
@@ -125,4 +155,5 @@ If your configured provider isn't available, Hermes automatically falls back:
 - **Local faster-whisper unavailable** → Tries a local `whisper` CLI or `HERMES_LOCAL_STT_COMMAND` before cloud providers
 - **Groq key not set** → Falls back to local transcription, then OpenAI
 - **OpenAI key not set** → Falls back to local transcription, then Groq
+- **Mistral key/SDK not set** → Skipped in auto-detect; falls through to next available provider
 - **Nothing available** → Voice messages pass through with an accurate note to the user

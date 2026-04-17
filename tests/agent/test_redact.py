@@ -82,6 +82,38 @@ class TestEnvAssignments:
         result = redact_sensitive_text(text)
         assert result == text
 
+    def test_lowercase_python_variable_token_unchanged(self):
+        # Regression: #4367 — lowercase 'token' assignment must not be redacted
+        text = "before_tokens = response.usage.prompt_tokens"
+        result = redact_sensitive_text(text)
+        assert result == text
+
+    def test_lowercase_python_variable_api_key_unchanged(self):
+        # Regression: #4367 — lowercase 'api_key' must not be redacted
+        text = "api_key = config.get('api_key')"
+        result = redact_sensitive_text(text)
+        assert result == text
+
+    def test_typescript_await_token_unchanged(self):
+        # Regression: #4367 — 'await' keyword must not be redacted as a secret value
+        text = "const token = await getToken();"
+        result = redact_sensitive_text(text)
+        assert result == text
+
+    def test_typescript_await_secret_unchanged(self):
+        # Regression: #4367 — similar pattern with 'secret' variable
+        text = "const secret = await fetchSecret();"
+        result = redact_sensitive_text(text)
+        assert result == text
+
+    def test_export_whitespace_preserved(self):
+        # Regression: #4367 — whitespace before uppercase env var must be preserved
+        text = "export SECRET_TOKEN=mypassword"
+        result = redact_sensitive_text(text)
+        assert result.startswith("export ")
+        assert "SECRET_TOKEN=" in result
+        assert "mypassword" not in result
+
 
 class TestJsonFields:
     def test_json_api_key(self):
@@ -252,3 +284,95 @@ class TestElevenLabsTavilyExaKeys:
         assert "XYZ789abcdef" not in result
         assert "HOME=/home/user" in result
         assert "SHELL=/bin/bash" in result
+
+
+class TestJWTTokens:
+    """JWT tokens start with eyJ (base64 for '{') and have dot-separated parts."""
+
+    def test_full_3part_jwt(self):
+        text = (
+            "Token: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"
+            ".eyJpc3MiOiI0MjNiZDJkYjg4MjI0MDAwIn0"
+            ".Gxgv0rru-_kS-I_60EJ7CENTnBh9UeuL3QhkMoQ-VnM"
+        )
+        result = redact_sensitive_text(text)
+        assert "Token:" in result
+        # Payload and signature must not survive
+        assert "eyJpc3Mi" not in result
+        assert "Gxgv0rru" not in result
+
+    def test_2part_jwt(self):
+        text = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0"
+        result = redact_sensitive_text(text)
+        assert "eyJzdWIi" not in result
+
+    def test_standalone_jwt_header(self):
+        text = "leaked header: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9 here"
+        result = redact_sensitive_text(text)
+        assert "IkpXVCJ9" not in result
+        assert "leaked header:" in result
+
+    def test_jwt_with_base64_padding(self):
+        text = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0=.abc123def456ghij"
+        result = redact_sensitive_text(text)
+        assert "abc123def456" not in result
+
+    def test_short_eyj_not_matched(self):
+        """eyJ followed by fewer than 10 base64 chars should not match."""
+        text = "eyJust a normal word"
+        assert redact_sensitive_text(text) == text
+
+    def test_jwt_preserves_surrounding_text(self):
+        text = "before eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0 after"
+        result = redact_sensitive_text(text)
+        assert result.startswith("before ")
+        assert result.endswith(" after")
+
+    def test_home_assistant_jwt_in_memory(self):
+        """Real-world pattern: HA token stored in agent memory block."""
+        text = (
+            "Home Assistant API Token: "
+            "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"
+            ".eyJpc3MiOiJhYmNkZWYiLCJleHAiOjE3NzQ5NTcxMDN9"
+            ".Gxgv0rru-_kS-I_60EJ7CENTnBh9UeuL3QhkMoQ-VnM"
+        )
+        result = redact_sensitive_text(text)
+        assert "Home Assistant API Token:" in result
+        assert "Gxgv0rru" not in result
+        assert "..." in result
+
+
+class TestDiscordMentions:
+    """Discord snowflake IDs in <@ID> or <@!ID> format."""
+
+    def test_normal_mention(self):
+        result = redact_sensitive_text("Hello <@222589316709220353>")
+        assert "222589316709220353" not in result
+        assert "<@***>" in result
+
+    def test_nickname_mention(self):
+        result = redact_sensitive_text("Ping <@!1331549159177846844>")
+        assert "1331549159177846844" not in result
+        assert "<@!***>" in result
+
+    def test_multiple_mentions(self):
+        text = "<@111111111111111111> and <@222222222222222222>"
+        result = redact_sensitive_text(text)
+        assert "111111111111111111" not in result
+        assert "222222222222222222" not in result
+
+    def test_short_id_not_matched(self):
+        """IDs shorter than 17 digits are not Discord snowflakes."""
+        text = "<@12345>"
+        assert redact_sensitive_text(text) == text
+
+    def test_slack_mention_not_matched(self):
+        """Slack mentions use letters, not pure digits."""
+        text = "<@U024BE7LH>"
+        assert redact_sensitive_text(text) == text
+
+    def test_preserves_surrounding_text(self):
+        text = "User <@222589316709220353> said hello"
+        result = redact_sensitive_text(text)
+        assert result.startswith("User ")
+        assert result.endswith(" said hello")

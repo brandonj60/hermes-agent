@@ -39,8 +39,8 @@ import re
 import shutil
 import tempfile
 from pathlib import Path
-from hermes_constants import get_hermes_home
-from typing import Dict, Any, Optional
+from hermes_constants import get_hermes_home, display_hermes_home
+from typing import Dict, Any, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -64,11 +64,11 @@ def _security_scan_skill(skill_dir: Path) -> Optional[str]:
             report = format_scan_report(result)
             return f"Security scan blocked this skill ({reason}):\n{report}"
         if allowed is None:
-            # "ask" — allow but include the warning so the user sees the findings
+            # "ask" verdict — for agent-created skills this means dangerous
+            # findings were detected.  Block the skill and include the report.
             report = format_scan_report(result)
-            logger.warning("Agent-created skill has security findings: %s", reason)
-            # Don't block — return None to allow, but log the warning
-            return None
+            logger.warning("Agent-created skill blocked (dangerous findings): %s", reason)
+            return f"Security scan blocked this skill ({reason}):\n{report}"
     except Exception as e:
         logger.warning("Security scan failed for %s: %s", skill_dir, e, exc_info=True)
     return None
@@ -82,6 +82,18 @@ SKILLS_DIR = HERMES_HOME / "skills"
 
 MAX_NAME_LENGTH = 64
 MAX_DESCRIPTION_LENGTH = 1024
+
+
+def _is_local_skill(skill_path: Path) -> bool:
+    """Check if a skill path is within the local SKILLS_DIR.
+
+    Skills found in external_dirs are read-only from the agent's perspective.
+    """
+    try:
+        skill_path.resolve().relative_to(SKILLS_DIR.resolve())
+        return True
+    except ValueError:
+        return False
 MAX_SKILL_CONTENT_CHARS = 100_000   # ~36k tokens at 2.75 chars/token
 MAX_SKILL_FILE_BYTES = 1_048_576    # 1 MiB per supporting file
 
@@ -90,11 +102,6 @@ VALID_NAME_RE = re.compile(r'^[a-z0-9][a-z0-9._-]*$')
 
 # Subdirectories allowed for write_file/remove_file
 ALLOWED_SUBDIRS = {"references", "templates", "scripts", "assets"}
-
-
-def check_skill_manage_requirements() -> bool:
-    """Skill management has no external requirements -- always available."""
-    return True
 
 
 # =============================================================================
@@ -203,14 +210,19 @@ def _resolve_skill_dir(name: str, category: str = None) -> Path:
 
 def _find_skill(name: str) -> Optional[Dict[str, Any]]:
     """
-    Find a skill by name in ~/.hermes/skills/.
-    Returns {"path": Path} or None.
+    Find a skill by name across all skill directories.
+
+    Searches the local skills dir (~/.hermes/skills/) first, then any
+    external dirs configured via skills.external_dirs.  Returns
+    {"path": Path} or None.
     """
-    if not SKILLS_DIR.exists():
-        return None
-    for skill_md in SKILLS_DIR.rglob("SKILL.md"):
-        if skill_md.parent.name == name:
-            return {"path": skill_md.parent}
+    from agent.skill_utils import get_all_skills_dirs
+    for skills_dir in get_all_skills_dirs():
+        if not skills_dir.exists():
+            continue
+        for skill_md in skills_dir.rglob("SKILL.md"):
+            if skill_md.parent.name == name:
+                return {"path": skill_md.parent}
     return None
 
 
@@ -219,13 +231,15 @@ def _validate_file_path(file_path: str) -> Optional[str]:
     Validate a file path for write_file/remove_file.
     Must be under an allowed subdirectory and not escape the skill dir.
     """
+    from tools.path_security import has_traversal_component
+
     if not file_path:
         return "file_path is required."
 
     normalized = Path(file_path)
 
     # Prevent path traversal
-    if ".." in normalized.parts:
+    if has_traversal_component(file_path):
         return "Path traversal ('..') is not allowed."
 
     # Must be under an allowed subdirectory
@@ -238,6 +252,17 @@ def _validate_file_path(file_path: str) -> Optional[str]:
         return f"Provide a file path, not just a directory. Example: '{normalized.parts[0]}/myfile.md'"
 
     return None
+
+
+def _resolve_skill_target(skill_dir: Path, file_path: str) -> Tuple[Optional[Path], Optional[str]]:
+    """Resolve a supporting-file path and ensure it stays within the skill directory."""
+    from tools.path_security import validate_within_dir
+
+    target = skill_dir / file_path
+    error = validate_within_dir(target, skill_dir)
+    if error:
+        return None, error
+    return target, None
 
 
 def _atomic_write_text(file_path: Path, content: str, encoding: str = "utf-8") -> None:
@@ -347,6 +372,9 @@ def _edit_skill(name: str, content: str) -> Dict[str, Any]:
     if not existing:
         return {"success": False, "error": f"Skill '{name}' not found. Use skills_list() to see available skills."}
 
+    if not _is_local_skill(existing["path"]):
+        return {"success": False, "error": f"Skill '{name}' is in an external directory and cannot be modified. Copy it to your local skills directory first."}
+
     skill_md = existing["path"] / "SKILL.md"
     # Back up original content for rollback
     original_content = skill_md.read_text(encoding="utf-8") if skill_md.exists() else None
@@ -387,6 +415,9 @@ def _patch_skill(
     if not existing:
         return {"success": False, "error": f"Skill '{name}' not found."}
 
+    if not _is_local_skill(existing["path"]):
+        return {"success": False, "error": f"Skill '{name}' is in an external directory and cannot be modified. Copy it to your local skills directory first."}
+
     skill_dir = existing["path"]
 
     if file_path:
@@ -394,7 +425,9 @@ def _patch_skill(
         err = _validate_file_path(file_path)
         if err:
             return {"success": False, "error": err}
-        target = skill_dir / file_path
+        target, err = _resolve_skill_target(skill_dir, file_path)
+        if err:
+            return {"success": False, "error": err}
     else:
         # Patching SKILL.md
         target = skill_dir / "SKILL.md"
@@ -410,7 +443,7 @@ def _patch_skill(
     # from exact-match failures on minor formatting mismatches.
     from tools.fuzzy_match import fuzzy_find_and_replace
 
-    new_content, match_count, match_error = fuzzy_find_and_replace(
+    new_content, match_count, _strategy, match_error = fuzzy_find_and_replace(
         content, old_string, new_string, replace_all
     )
     if match_error:
@@ -458,6 +491,9 @@ def _delete_skill(name: str) -> Dict[str, Any]:
     if not existing:
         return {"success": False, "error": f"Skill '{name}' not found."}
 
+    if not _is_local_skill(existing["path"]):
+        return {"success": False, "error": f"Skill '{name}' is in an external directory and cannot be deleted."}
+
     skill_dir = existing["path"]
     shutil.rmtree(skill_dir)
 
@@ -500,7 +536,12 @@ def _write_file(name: str, file_path: str, file_content: str) -> Dict[str, Any]:
     if not existing:
         return {"success": False, "error": f"Skill '{name}' not found. Create it first with action='create'."}
 
-    target = existing["path"] / file_path
+    if not _is_local_skill(existing["path"]):
+        return {"success": False, "error": f"Skill '{name}' is in an external directory and cannot be modified. Copy it to your local skills directory first."}
+
+    target, err = _resolve_skill_target(existing["path"], file_path)
+    if err:
+        return {"success": False, "error": err}
     target.parent.mkdir(parents=True, exist_ok=True)
     # Back up for rollback
     original_content = target.read_text(encoding="utf-8") if target.exists() else None
@@ -531,9 +572,15 @@ def _remove_file(name: str, file_path: str) -> Dict[str, Any]:
     existing = _find_skill(name)
     if not existing:
         return {"success": False, "error": f"Skill '{name}' not found."}
+
+    if not _is_local_skill(existing["path"]):
+        return {"success": False, "error": f"Skill '{name}' is in an external directory and cannot be modified."}
+
     skill_dir = existing["path"]
 
-    target = skill_dir / file_path
+    target, err = _resolve_skill_target(skill_dir, file_path)
+    if err:
+        return {"success": False, "error": err}
     if not target.exists():
         # List what's actually there for the model to see
         available = []
@@ -584,19 +631,19 @@ def skill_manage(
     """
     if action == "create":
         if not content:
-            return json.dumps({"success": False, "error": "content is required for 'create'. Provide the full SKILL.md text (frontmatter + body)."}, ensure_ascii=False)
+            return tool_error("content is required for 'create'. Provide the full SKILL.md text (frontmatter + body).", success=False)
         result = _create_skill(name, content, category)
 
     elif action == "edit":
         if not content:
-            return json.dumps({"success": False, "error": "content is required for 'edit'. Provide the full updated SKILL.md text."}, ensure_ascii=False)
+            return tool_error("content is required for 'edit'. Provide the full updated SKILL.md text.", success=False)
         result = _edit_skill(name, content)
 
     elif action == "patch":
         if not old_string:
-            return json.dumps({"success": False, "error": "old_string is required for 'patch'. Provide the text to find."}, ensure_ascii=False)
+            return tool_error("old_string is required for 'patch'. Provide the text to find.", success=False)
         if new_string is None:
-            return json.dumps({"success": False, "error": "new_string is required for 'patch'. Use empty string to delete matched text."}, ensure_ascii=False)
+            return tool_error("new_string is required for 'patch'. Use empty string to delete matched text.", success=False)
         result = _patch_skill(name, old_string, new_string, file_path, replace_all)
 
     elif action == "delete":
@@ -604,14 +651,14 @@ def skill_manage(
 
     elif action == "write_file":
         if not file_path:
-            return json.dumps({"success": False, "error": "file_path is required for 'write_file'. Example: 'references/api-guide.md'"}, ensure_ascii=False)
+            return tool_error("file_path is required for 'write_file'. Example: 'references/api-guide.md'", success=False)
         if file_content is None:
-            return json.dumps({"success": False, "error": "file_content is required for 'write_file'."}, ensure_ascii=False)
+            return tool_error("file_content is required for 'write_file'.", success=False)
         result = _write_file(name, file_path, file_content)
 
     elif action == "remove_file":
         if not file_path:
-            return json.dumps({"success": False, "error": "file_path is required for 'remove_file'."}, ensure_ascii=False)
+            return tool_error("file_path is required for 'remove_file'.", success=False)
         result = _remove_file(name, file_path)
 
     else:
@@ -636,7 +683,7 @@ SKILL_MANAGE_SCHEMA = {
     "description": (
         "Manage skills (create, update, delete). Skills are your procedural "
         "memory — reusable approaches for recurring task types. "
-        "New skills go to ~/.hermes/skills/; existing skills can be modified wherever they live.\n\n"
+        f"New skills go to {display_hermes_home()}/skills/; existing skills can be modified wherever they live.\n\n"
         "Actions: create (full SKILL.md + optional category), "
         "patch (old_string/new_string — preferred for fixes), "
         "edit (full SKILL.md rewrite — major overhauls only), "
@@ -722,7 +769,7 @@ SKILL_MANAGE_SCHEMA = {
 
 
 # --- Registry ---
-from tools.registry import registry
+from tools.registry import registry, tool_error
 
 registry.register(
     name="skill_manage",

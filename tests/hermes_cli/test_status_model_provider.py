@@ -64,7 +64,7 @@ def test_show_status_displays_legacy_string_model_and_custom_endpoint(monkeypatc
 
 
 def test_show_status_reports_managed_nous_features(monkeypatch, capsys, tmp_path):
-    monkeypatch.setenv("HERMES_ENABLE_NOUS_MANAGED_TOOLS", "1")
+    monkeypatch.setattr("hermes_cli.status.managed_nous_tools_enabled", lambda: True)
     from hermes_cli import status as status_mod
 
     _patch_common_status_deps(monkeypatch, status_mod, tmp_path)
@@ -88,7 +88,7 @@ def test_show_status_reports_managed_nous_features(monkeypatch, capsys, tmp_path
                 "web": NousFeatureState("web", "Web tools", True, True, True, True, False, True, "firecrawl"),
                 "image_gen": NousFeatureState("image_gen", "Image generation", True, True, True, True, False, True, "Nous Subscription"),
                 "tts": NousFeatureState("tts", "OpenAI TTS", True, True, True, True, False, True, "OpenAI TTS"),
-                "browser": NousFeatureState("browser", "Browser automation", True, True, True, True, False, True, "Browserbase"),
+                "browser": NousFeatureState("browser", "Browser automation", True, True, True, True, False, True, "Browser Use"),
                 "modal": NousFeatureState("modal", "Modal execution", False, True, False, False, False, True, "local"),
             },
         ),
@@ -98,13 +98,13 @@ def test_show_status_reports_managed_nous_features(monkeypatch, capsys, tmp_path
     status_mod.show_status(SimpleNamespace(all=False, deep=False))
 
     out = capsys.readouterr().out
-    assert "Nous Subscription Features" in out
+    assert "Nous Tool Gateway" in out
     assert "Browser automation" in out
     assert "active via Nous subscription" in out
 
 
 def test_show_status_hides_nous_subscription_section_when_feature_flag_is_off(monkeypatch, capsys, tmp_path):
-    monkeypatch.delenv("HERMES_ENABLE_NOUS_MANAGED_TOOLS", raising=False)
+    monkeypatch.setattr("hermes_cli.status.managed_nous_tools_enabled", lambda: False)
     from hermes_cli import status as status_mod
 
     _patch_common_status_deps(monkeypatch, status_mod, tmp_path)
@@ -121,4 +121,4 @@ def test_show_status_hides_nous_subscription_section_when_feature_flag_is_off(mo
     status_mod.show_status(SimpleNamespace(all=False, deep=False))
 
     out = capsys.readouterr().out
-    assert "Nous Subscription Features" not in out
+    assert "Nous Tool Gateway" not in out

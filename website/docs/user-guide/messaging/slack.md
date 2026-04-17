@@ -54,6 +54,7 @@ Navigate to **Features → OAuth & Permissions** in the sidebar. Scroll to **Sco
 | `im:read` | View basic DM info |
 | `im:write` | Open and manage DMs |
 | `users:read` | Look up user information |
+| `files:read` | Read and download attached files, including voice notes/audio |
 | `files:write` | Upload files (images, audio, documents) |
 
 :::caution Missing scopes = missing features
@@ -210,11 +211,10 @@ Understanding how Hermes behaves in different contexts:
 |---------|----------|
 | **DMs** | Bot responds to every message — no @mention needed |
 | **Channels** | Bot **only responds when @mentioned** (e.g., `@Hermes Agent what time is it?`). In channels, Hermes replies in a thread attached to that message. |
-| **Threads** | If you @mention Hermes inside an existing thread, it replies in that same thread. |
+| **Threads** | If you @mention Hermes inside an existing thread, it replies in that same thread. Once the bot has an active session in a thread, **subsequent replies in that thread do not require @mention** — the bot follows the conversation naturally. |
 
 :::tip
-In channels, always @mention the bot. Simply typing a message without mentioning it will be ignored.
-This is intentional — it prevents the bot from responding to every message in busy channels.
+In channels, always @mention the bot to start a conversation. Once the bot is active in a thread, you can reply in that thread without mentioning it. Outside of threads, messages without @mention are ignored to prevent noise in busy channels.
 :::
 
 ---
@@ -283,7 +283,7 @@ slack:
 ```
 
 :::info
-Unlike Discord and Telegram, Slack does not have a `free_response_channels` equivalent. The Slack adapter always requires `@mention` in channels — this is hardcoded behavior. In DMs, the bot always responds without needing a mention.
+Unlike Discord and Telegram, Slack does not have a `free_response_channels` equivalent. The Slack adapter requires `@mention` to start a conversation in channels. However, once the bot has an active session in a thread, subsequent thread replies do not require a mention. In DMs, the bot always responds without needing a mention.
 :::
 
 ### Unauthorized User Handling
@@ -384,7 +384,7 @@ platforms:
 In addition to tokens in the environment or config, Hermes also loads tokens from an **OAuth token file** at:
 
 ```
-~/.hermes/platforms/slack/slack_tokens.json
+~/.hermes/slack_tokens.json
 ```
 
 This file is a JSON object mapping team IDs to token entries:
@@ -417,6 +417,23 @@ Hermes supports voice on Slack:
 - **Outgoing:** TTS responses are sent as audio file attachments
 
 ---
+
+## Per-Channel Prompts
+
+Assign ephemeral system prompts to specific Slack channels. The prompt is injected at runtime on every turn — never persisted to transcript history — so changes take effect immediately.
+
+```yaml
+slack:
+  channel_prompts:
+    "C01RESEARCH": |
+      You are a research assistant. Focus on academic sources,
+      citations, and concise synthesis.
+    "C02ENGINEERING": |
+      Code review mode. Be precise about edge cases and
+      performance implications.
+```
+
+Keys are Slack channel IDs (find them via channel details → "About" → scroll to bottom). All messages in the matching channel get the prompt injected as an ephemeral system instruction.
 
 ## Troubleshooting
 

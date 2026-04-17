@@ -59,7 +59,7 @@ from tools.managed_tool_gateway import (
     read_nous_access_token as _read_nous_access_token,
     resolve_managed_tool_gateway,
 )
-from tools.tool_backend_helpers import managed_nous_tools_enabled
+from tools.tool_backend_helpers import managed_nous_tools_enabled, prefers_gateway
 from tools.url_safety import is_safe_url
 from tools.website_policy import check_website_access
 
@@ -165,8 +165,8 @@ def _raise_web_backend_configuration_error() -> None:
     )
     if managed_nous_tools_enabled():
         message += (
-            " If you have the hidden Nous-managed tools flag enabled, you can also login to Nous "
-            "(`hermes model`) and provide FIRECRAWL_GATEWAY_URL or TOOL_GATEWAY_DOMAIN."
+            " With your Nous subscription you can also use the Tool Gateway — "
+            "run `hermes tools` and select Nous Subscription as the web provider."
         )
     raise ValueError(message)
 
@@ -176,8 +176,8 @@ def _firecrawl_backend_help_suffix() -> str:
     if not managed_nous_tools_enabled():
         return ""
     return (
-        ", or, if you have the hidden Nous-managed tools flag enabled, login to Nous and use "
-        "FIRECRAWL_GATEWAY_URL or TOOL_GATEWAY_DOMAIN"
+        ", or use the Nous Tool Gateway via your subscription "
+        "(FIRECRAWL_GATEWAY_URL or TOOL_GATEWAY_DOMAIN)"
     )
 
 
@@ -205,13 +205,14 @@ def _web_requires_env() -> list[str]:
 def _get_firecrawl_client():
     """Get or create Firecrawl client.
 
-    Direct Firecrawl takes precedence when explicitly configured. Otherwise
-    Hermes falls back to the Firecrawl tool-gateway for logged-in Nous Subscribers.
+    When ``web.use_gateway`` is set in config, the Tool Gateway is preferred
+    even if direct Firecrawl credentials are present.  Otherwise direct
+    Firecrawl takes precedence when explicitly configured.
     """
     global _firecrawl_client, _firecrawl_client_config
 
     direct_config = _get_direct_firecrawl_config()
-    if direct_config is not None:
+    if direct_config is not None and not prefers_gateway("web"):
         kwargs, client_config = direct_config
     else:
         managed_gateway = resolve_managed_tool_gateway(
@@ -554,8 +555,24 @@ async def process_content_with_llm(
         return processed_content
         
     except Exception as e:
-        logger.debug("Error processing content with LLM: %s", e)
-        return f"[Failed to process content: {str(e)[:100]}. Content size: {len(content):,} chars]"
+        logger.warning(
+            "web_extract LLM summarization failed (%s). "
+            "Tip: increase auxiliary.web_extract.timeout in config.yaml "
+            "or switch to a faster auxiliary model.",
+            str(e)[:120],
+        )
+        # Fall back to truncated raw content instead of returning a useless
+        # error message.  The first ~5000 chars are almost always more useful
+        # to the model than "[Failed to process content: ...]".
+        truncated = content[:MAX_OUTPUT_SIZE]
+        if len(content) > MAX_OUTPUT_SIZE:
+            truncated += (
+                f"\n\n[Content truncated — showing first {MAX_OUTPUT_SIZE:,} of "
+                f"{len(content):,} chars. LLM summarization timed out. "
+                f"To fix: increase auxiliary.web_extract.timeout in config.yaml, "
+                f"or use a faster auxiliary model. Use browser_navigate for the full page.]"
+            )
+        return truncated
 
 
 async def _call_summarizer_llm(
@@ -620,8 +637,9 @@ Your goal is to preserve ALL important information while reducing length. Never 
 
 Create a markdown summary that captures all key information in a well-organized, scannable format. Include important quotes and code snippets in their original formatting. Focus on actionable information, specific details, and unique insights."""
 
-    # Call the LLM with retry logic
-    max_retries = 6
+    # Call the LLM with retry logic — keep retries low since summarization
+    # is a nice-to-have; the caller falls back to truncated content on failure.
+    max_retries = 2
     retry_delay = 2
     last_error = None
 
@@ -640,6 +658,9 @@ Create a markdown summary that captures all key information in a well-organized,
                 ],
                 "temperature": 0.1,
                 "max_tokens": max_tokens,
+                # No explicit timeout — async_call_llm reads auxiliary.web_extract.timeout
+                # from config (default 360s / 6min).  Users with slow local models can
+                # increase it in config.yaml.
             }
             if extra_body:
                 call_kwargs["extra_body"] = extra_body
@@ -788,6 +809,15 @@ Create a single, unified markdown summary."""
             logger.warning("Synthesis LLM returned empty content, retrying once")
             response = await async_call_llm(**call_kwargs)
             final_summary = extract_content_or_reasoning(response)
+
+        # If still None after retry, fall back to concatenated summaries
+        if not final_summary:
+            logger.warning("Synthesis failed after retry — concatenating chunk summaries")
+            fallback = "\n\n".join(summaries)
+            if len(fallback) > max_output_size:
+                fallback = fallback[:max_output_size] + "\n\n[... truncated ...]"
+            return fallback
+
         # Enforce hard cap
         if len(final_summary) > max_output_size:
             final_summary = final_summary[:max_output_size] + "\n\n[... summary truncated for context management ...]"
@@ -1050,7 +1080,7 @@ def web_search_tool(query: str, limit: int = 5) -> str:
     try:
         from tools.interrupt import is_interrupted
         if is_interrupted():
-            return json.dumps({"error": "Interrupted", "success": False})
+            return tool_error("Interrupted", success=False)
 
         # Dispatch to the configured backend
         backend = _get_backend()
@@ -1129,7 +1159,7 @@ def web_search_tool(query: str, limit: int = 5) -> str:
         _debug.log_call("web_search_tool", debug_call_data)
         _debug.save()
 
-        return json.dumps({"error": error_msg}, ensure_ascii=False)
+        return tool_error(error_msg)
 
 
 async def web_extract_tool(
@@ -1161,10 +1191,12 @@ async def web_extract_tool(
     Raises:
         Exception: If extraction fails or API key is not set
     """
-    # Block URLs containing embedded secrets (exfiltration prevention)
+    # Block URLs containing embedded secrets (exfiltration prevention).
+    # URL-decode first so percent-encoded secrets (%73k- = sk-) are caught.
     from agent.redact import _PREFIX_RE
+    from urllib.parse import unquote
     for _url in urls:
-        if _PREFIX_RE.search(_url):
+        if _PREFIX_RE.search(_url) or _PREFIX_RE.search(unquote(_url)):
             return json.dumps({
                 "success": False,
                 "error": "Blocked: URL contains what appears to be an API key or token. "
@@ -1255,10 +1287,24 @@ async def web_extract_tool(
 
                     try:
                         logger.info("Scraping: %s", url)
-                        scrape_result = _get_firecrawl_client().scrape(
-                            url=url,
-                            formats=formats
-                        )
+                        # Run synchronous Firecrawl scrape in a thread with a
+                        # 60s timeout so a hung fetch doesn't block the session.
+                        try:
+                            scrape_result = await asyncio.wait_for(
+                                asyncio.to_thread(
+                                    _get_firecrawl_client().scrape,
+                                    url=url,
+                                    formats=formats,
+                                ),
+                                timeout=60,
+                            )
+                        except asyncio.TimeoutError:
+                            logger.warning("Firecrawl scrape timed out for %s", url)
+                            results.append({
+                                "url": url, "title": "", "content": "",
+                                "error": "Scrape timed out after 60s — page may be too large or unresponsive. Try browser_navigate instead.",
+                            })
+                            continue
 
                         scrape_payload = _extract_scrape_payload(scrape_result)
                         metadata = scrape_payload.get("metadata", {})
@@ -1415,7 +1461,7 @@ async def web_extract_tool(
         trimmed_response = {"results": trimmed_results}
 
         if trimmed_response.get("results") == []:
-            result_json = json.dumps({"error": "Content was inaccessible or not found"}, ensure_ascii=False)
+            result_json = tool_error("Content was inaccessible or not found")
 
             cleaned_result = clean_base64_images(result_json)
         
@@ -1441,7 +1487,7 @@ async def web_extract_tool(
         _debug.log_call("web_extract_tool", debug_call_data)
         _debug.save()
         
-        return json.dumps({"error": error_msg}, ensure_ascii=False)
+        return tool_error(error_msg)
 
 
 async def web_crawl_tool(
@@ -1517,7 +1563,7 @@ async def web_crawl_tool(
 
             from tools.interrupt import is_interrupted as _is_int
             if _is_int():
-                return json.dumps({"error": "Interrupted", "success": False})
+                return tool_error("Interrupted", success=False)
 
             logger.info("Tavily crawl: %s", url)
             payload: Dict[str, Any] = {
@@ -1628,7 +1674,7 @@ async def web_crawl_tool(
         
         from tools.interrupt import is_interrupted as _is_int
         if _is_int():
-            return json.dumps({"error": "Interrupted", "success": False})
+            return tool_error("Interrupted", success=False)
 
         try:
             crawl_result = _get_firecrawl_client().crawl(
@@ -1854,7 +1900,7 @@ async def web_crawl_tool(
         _debug.log_call("web_crawl_tool", debug_call_data)
         _debug.save()
         
-        return json.dumps({"error": error_msg}, ensure_ascii=False)
+        return tool_error(error_msg)
 
 
 # Convenience function to check Firecrawl credentials
@@ -1887,9 +1933,6 @@ def check_auxiliary_model() -> bool:
     return client is not None
 
 
-def get_debug_session_info() -> Dict[str, Any]:
-    """Get information about the current debug session."""
-    return _debug.get_session_info()
 
 
 if __name__ == "__main__":
@@ -2000,7 +2043,7 @@ if __name__ == "__main__":
 # ---------------------------------------------------------------------------
 # Registry
 # ---------------------------------------------------------------------------
-from tools.registry import registry
+from tools.registry import registry, tool_error
 
 WEB_SEARCH_SCHEMA = {
     "name": "web_search",
@@ -2042,6 +2085,7 @@ registry.register(
     check_fn=check_web_api_key,
     requires_env=_web_requires_env(),
     emoji="🔍",
+    max_result_size_chars=100_000,
 )
 registry.register(
     name="web_extract",
@@ -2053,4 +2097,5 @@ registry.register(
     requires_env=_web_requires_env(),
     is_async=True,
     emoji="📄",
+    max_result_size_chars=100_000,
 )

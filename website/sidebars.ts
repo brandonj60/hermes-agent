@@ -9,6 +9,7 @@ const sidebars: SidebarsConfig = {
       items: [
         'getting-started/quickstart',
         'getting-started/installation',
+        'getting-started/termux',
         'getting-started/nix-setup',
         'getting-started/updating',
         'getting-started/learning-path',
@@ -35,6 +36,7 @@ const sidebars: SidebarsConfig = {
       collapsed: true,
       items: [
         'user-guide/features/overview',
+        'user-guide/features/tool-gateway',
         {
           type: 'category',
           label: 'Core',
@@ -42,6 +44,7 @@ const sidebars: SidebarsConfig = {
             'user-guide/features/tools',
             'user-guide/features/skills',
             'user-guide/features/memory',
+            'user-guide/features/memory-providers',
             'user-guide/features/context-files',
             'user-guide/features/context-references',
             'user-guide/features/personality',
@@ -73,6 +76,14 @@ const sidebars: SidebarsConfig = {
         },
         {
           type: 'category',
+          label: 'Management',
+          items: [
+            'user-guide/features/web-dashboard',
+            'user-guide/features/dashboard-plugins',
+          ],
+        },
+        {
+          type: 'category',
           label: 'Advanced',
           items: [
             'user-guide/features/rl-training',
@@ -83,6 +94,7 @@ const sidebars: SidebarsConfig = {
           label: 'Skills',
           items: [
             'user-guide/skills/godmode',
+            'user-guide/skills/google-workspace',
           ],
         },
       ],
@@ -106,6 +118,10 @@ const sidebars: SidebarsConfig = {
         'user-guide/messaging/dingtalk',
         'user-guide/messaging/feishu',
         'user-guide/messaging/wecom',
+        'user-guide/messaging/wecom-callback',
+        'user-guide/messaging/weixin',
+        'user-guide/messaging/bluebubbles',
+        'user-guide/messaging/qqbot',
         'user-guide/messaging/open-webui',
         'user-guide/messaging/webhooks',
       ],
@@ -123,6 +139,7 @@ const sidebars: SidebarsConfig = {
         'user-guide/features/honcho',
         'user-guide/features/provider-routing',
         'user-guide/features/fallback-providers',
+        'user-guide/features/credential-pools',
       ],
     },
     {
@@ -131,14 +148,21 @@ const sidebars: SidebarsConfig = {
       collapsed: true,
       items: [
         'guides/tips',
-        'guides/build-a-hermes-plugin',
+        'guides/local-llm-on-mac',
         'guides/daily-briefing-bot',
         'guides/team-telegram-assistant',
         'guides/python-library',
         'guides/use-mcp-with-hermes',
         'guides/use-soul-with-hermes',
         'guides/use-voice-mode-with-hermes',
+        'guides/build-a-hermes-plugin',
+        'guides/automate-with-cron',
+        'guides/automation-templates',
+        'guides/cron-troubleshooting',
+        'guides/work-with-skills',
+        'guides/delegation-patterns',
         'guides/migrate-from-openclaw',
+        'guides/aws-bedrock',
       ],
     },
     {
@@ -166,6 +190,9 @@ const sidebars: SidebarsConfig = {
           items: [
             'developer-guide/adding-tools',
             'developer-guide/adding-providers',
+            'developer-guide/adding-platform-adapters',
+            'developer-guide/memory-provider-plugin',
+            'developer-guide/context-engine-plugin',
             'developer-guide/creating-skills',
             'developer-guide/extending-the-cli',
           ],
